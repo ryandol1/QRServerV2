@@ -86,14 +86,18 @@ def _download_pdf(url: str, unique_id: str) -> Optional[str]:
     """
     try:
         # Download the file
-        response = requests.get(url, timeout=30, stream=True)
+        print(f"Downloading PDF for {unique_id} from: {url}")
+        response = requests.get(url, timeout=30, stream=True, allow_redirects=True)
         response.raise_for_status()
         
-        # Check if content type is PDF (but don't fail if it's not set correctly)
+        # Log response details for debugging
         content_type = response.headers.get("Content-Type", "").lower()
+        content_length = response.headers.get("Content-Length", "unknown")
+        print(f"Response for {unique_id}: Content-Type={content_type}, Content-Length={content_length}, Status={response.status_code}")
+        
+        # Check if content type is PDF (but don't fail if it's not set correctly)
         if "pdf" not in content_type and not url.lower().endswith(".pdf"):
-            # Still try to save it, but log a warning
-            pass
+            print(f"Warning: Content-Type is '{content_type}', not 'application/pdf' for {unique_id}")
         
         # Generate a safe filename from unique_id
         safe_id = _sanitize_unique_id(unique_id)
@@ -103,17 +107,33 @@ def _download_pdf(url: str, unique_id: str) -> Optional[str]:
         file_path.parent.mkdir(parents=True, exist_ok=True)
         
         # Save the file
+        bytes_written = 0
         with open(file_path, "wb") as f:
             for chunk in response.iter_content(chunk_size=8192):
-                f.write(chunk)
+                if chunk:
+                    f.write(chunk)
+                    bytes_written += len(chunk)
+        
+        print(f"Downloaded {bytes_written} bytes for {unique_id} to {file_path}")
         
         # Verify the file is actually a PDF by checking the header
         try:
             with open(file_path, "rb") as f:
-                header = f.read(4)
-                if header != b"%PDF":
-                    print(f"Warning: Downloaded file for {unique_id} does not appear to be a valid PDF (header: {header})")
-                    # Still return the path, but log the warning
+                header = f.read(1024)  # Read more to check for HTML
+                file_size = file_path.stat().st_size
+                
+                if header.startswith(b"%PDF"):
+                    pdf_version = header[4:8].decode('ascii', errors='ignore')
+                    print(f"Valid PDF detected for {unique_id}: PDF version {pdf_version}, size={file_size} bytes")
+                elif header.startswith(b"<!DOCTYPE") or header.startswith(b"<html") or b"<HTML" in header[:100]:
+                    print(f"ERROR: Downloaded file for {unique_id} appears to be HTML, not PDF!")
+                    print(f"First 500 chars: {header[:500].decode('utf-8', errors='ignore')}")
+                    # Store this info for debugging
+                    redirect_map.get(unique_id, {}).get("_debug_info", {})["download_error"] = "File appears to be HTML, not PDF"
+                else:
+                    print(f"Warning: Downloaded file for {unique_id} does not appear to be a valid PDF")
+                    print(f"Header (first 100 bytes): {header[:100]}")
+                    print(f"File size: {file_size} bytes")
         except Exception as e:
             print(f"Error verifying PDF for {unique_id}: {e}")
         
@@ -122,6 +142,8 @@ def _download_pdf(url: str, unique_id: str) -> Optional[str]:
     except Exception as e:
         # Log error but don't fail the entire request
         print(f"Error downloading PDF from {url}: {e}")
+        import traceback
+        print(traceback.format_exc())
         return None
 
 
@@ -644,6 +666,58 @@ def download_pdf(unique_id: str):
         }), 500
 
 
+@app.route("/pdf/<unique_id>/info", methods=["GET"])
+def pdf_info(unique_id: str):
+    """Get debugging information about a PDF file."""
+    entry = redirect_map.get(unique_id)
+    if not entry:
+        return jsonify({"error": "unique_id not found"}), 404
+    
+    file_path, error = _get_pdf_path(unique_id)
+    if not file_path:
+        return jsonify({
+            "error": error,
+            "unique_id": unique_id
+        }), 404
+    
+    info = {
+        "unique_id": unique_id,
+        "file_path": str(file_path),
+        "file_exists": file_path.exists(),
+    }
+    
+    if file_path.exists():
+        try:
+            file_size = file_path.stat().st_size
+            info["file_size_bytes"] = file_size
+            info["file_size_kb"] = round(file_size / 1024, 2)
+            
+            # Read file header
+            with open(file_path, "rb") as f:
+                header = f.read(1024)
+                
+            if header.startswith(b"%PDF"):
+                pdf_version = header[4:8].decode('ascii', errors='ignore')
+                info["is_valid_pdf"] = True
+                info["pdf_version"] = pdf_version
+            elif header.startswith(b"<!DOCTYPE") or header.startswith(b"<html") or b"<HTML" in header[:100]:
+                info["is_valid_pdf"] = False
+                info["file_type"] = "HTML"
+                info["preview"] = header[:500].decode('utf-8', errors='ignore')
+            else:
+                info["is_valid_pdf"] = False
+                info["file_type"] = "Unknown"
+                info["header_hex"] = header[:100].hex()
+                info["header_preview"] = header[:100].decode('utf-8', errors='ignore')
+        except Exception as e:
+            info["error"] = str(e)
+    
+    info["final_url"] = entry.get("final_url")
+    info["local_file_path"] = entry.get("local_file_path")
+    
+    return jsonify(info)
+
+
 @app.route("/admin/export/<fmt>", methods=["GET"])
 def export_entries(fmt: str):
     fmt = fmt.lower()
@@ -750,7 +824,8 @@ def view_entries():
                     <td>
                         {% if entry.local_pdf_url %}
                             <a href="{{ entry.local_pdf_url }}">View PDF</a> | 
-                            <a href="{{ url_for('download_pdf', unique_id=unique_id) }}">Download</a>
+                            <a href="{{ url_for('download_pdf', unique_id=unique_id) }}">Download</a> |
+                            <a href="{{ url_for('pdf_info', unique_id=unique_id) }}" target="_blank">Info</a>
                         {% else %}
                             <span style="color: #999;">N/A</span>
                         {% endif %}
