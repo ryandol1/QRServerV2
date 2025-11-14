@@ -557,16 +557,15 @@ def serve_qr_code_local(unique_id: str):
     )
 
 
-@app.route("/pdf/<unique_id>", methods=["GET"])
-def serve_pdf(unique_id: str):
-    """Serve the locally stored PDF file in browser (not as download)."""
+def _get_pdf_path(unique_id: str) -> Tuple[Optional[Path], Optional[str]]:
+    """Helper function to get the PDF file path for a given unique_id."""
     entry = redirect_map.get(unique_id)
     if not entry:
-        return jsonify({"error": "unique_id not found"}), 404
+        return None, "unique_id not found"
     
     local_file_path = entry.get("local_file_path")
     if not local_file_path:
-        return jsonify({"error": "local PDF not available"}), 404
+        return None, "local PDF not available"
     
     # Try to resolve the file path - handle both absolute and relative paths
     file_path = Path(local_file_path)
@@ -580,9 +579,18 @@ def serve_pdf(unique_id: str):
         file_path = PDF_STORAGE_DIR / f"{safe_id}.pdf"
     
     if not file_path.exists():
+        return None, f"PDF file not found on server (expected path: {file_path})"
+    
+    return file_path, None
+
+
+@app.route("/pdf/<unique_id>", methods=["GET"])
+def serve_pdf(unique_id: str):
+    """Serve the locally stored PDF file in browser (not as download)."""
+    file_path, error = _get_pdf_path(unique_id)
+    if not file_path:
         return jsonify({
-            "error": "PDF file not found on server",
-            "details": f"Expected path: {file_path}",
+            "error": error,
             "unique_id": unique_id
         }), 404
     
@@ -603,6 +611,35 @@ def serve_pdf(unique_id: str):
         print(f"Error serving PDF for {unique_id}: {e}")
         return jsonify({
             "error": "Error serving PDF file",
+            "details": str(e)
+        }), 500
+
+
+@app.route("/pdf/<unique_id>/download", methods=["GET"])
+def download_pdf(unique_id: str):
+    """Download the locally stored PDF file."""
+    file_path, error = _get_pdf_path(unique_id)
+    if not file_path:
+        return jsonify({
+            "error": error,
+            "unique_id": unique_id
+        }), 404
+    
+    try:
+        response = send_file(
+            str(file_path),
+            mimetype="application/pdf",
+            as_attachment=True,
+            download_name=f"{unique_id}.pdf",
+        )
+        # Force download
+        response.headers["Content-Disposition"] = f'attachment; filename="{unique_id}.pdf"'
+        response.headers["Content-Type"] = "application/pdf"
+        return response
+    except Exception as e:
+        print(f"Error downloading PDF for {unique_id}: {e}")
+        return jsonify({
+            "error": "Error downloading PDF file",
             "details": str(e)
         }), 500
 
@@ -712,7 +749,8 @@ def view_entries():
                     </td>
                     <td>
                         {% if entry.local_pdf_url %}
-                            <a href="{{ entry.local_pdf_url }}">View PDF</a>
+                            <a href="{{ entry.local_pdf_url }}">View PDF</a> | 
+                            <a href="{{ url_for('download_pdf', unique_id=unique_id) }}">Download</a>
                         {% else %}
                             <span style="color: #999;">N/A</span>
                         {% endif %}
