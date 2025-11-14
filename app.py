@@ -412,8 +412,16 @@ def admin_form():
             <p>Redirect URL: <a href="{{ result.redirect_url }}">{{ result.redirect_url }}</a></p>
             <p>Final URL: <a href="{{ result.final_url }}">{{ result.final_url }}</a></p>
             <div class="qr">
+                <h3>Redirect QR Code</h3>
                 <img src="data:image/png;base64,{{ result.qr_code_base64 }}" alt="QR Code" />
             </div>
+            {% if result.qr_local_base64 %}
+            <div class="qr">
+                <h3>Local PDF QR Code</h3>
+                <img src="data:image/png;base64,{{ result.qr_local_base64 }}" alt="Local QR Code" />
+                <p><a href="{{ result.local_pdf_url }}">View Local PDF</a></p>
+            </div>
+            {% endif %}
         </div>
         {% endif %}
 
@@ -472,12 +480,25 @@ def admin_form():
         try:
             entry, redirect_url, status = _register_redirect(unique_id, final_url)
             qr_code_b64 = _encode_qr_code(redirect_url)
-            context["result"] = {
+            
+            env_base = os.getenv("BASE_URL")
+            if env_base:
+                base = env_base.rstrip("/")
+            else:
+                base = request.url_root.rstrip("/")
+            
+            result_data = {
                 "status": status,
                 "redirect_url": redirect_url,
                 "final_url": entry["final_url"],
                 "qr_code_base64": qr_code_b64,
             }
+            
+            if entry.get("qr_local_base64"):
+                result_data["qr_local_base64"] = entry["qr_local_base64"]
+                result_data["local_pdf_url"] = f"{base}/pdf/{unique_id}"
+            
+            context["result"] = result_data
         except (ValueError, TypeError) as exc:
             context["error"] = str(exc)
 
@@ -629,6 +650,8 @@ def view_entries():
                     <th>Redirect URL</th>
                     <th>Final URL</th>
                     <th>QR Code</th>
+                    <th>Local QR Code</th>
+                    <th>Local PDF</th>
                     <th>Actions</th>
                 </tr>
             </thead>
@@ -639,6 +662,20 @@ def view_entries():
                     <td><a href="{{ entry.redirect_url }}">{{ entry.redirect_url }}</a></td>
                     <td><a href="{{ entry.final_url }}">{{ entry.final_url }}</a></td>
                     <td><a href="{{ url_for('serve_qr_code', unique_id=unique_id) }}">QR</a></td>
+                    <td>
+                        {% if entry.has_local_qr %}
+                            <a href="{{ url_for('serve_qr_code_local', unique_id=unique_id) }}">Local QR</a>
+                        {% else %}
+                            <span style="color: #999;">N/A</span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% if entry.local_pdf_url %}
+                            <a href="{{ entry.local_pdf_url }}">View PDF</a>
+                        {% else %}
+                            <span style="color: #999;">N/A</span>
+                        {% endif %}
+                    </td>
                     <td class="actions">
                         {% if confirm_id == unique_id %}
                         <span class="confirm">
@@ -665,15 +702,19 @@ def view_entries():
     """
     rows = []
     for unique_id, entry in redirect_map.items():
-        rows.append(
-            (
-                unique_id,
-                {
-                    "redirect_url": _build_redirect_url(entry["redirect_slug"]),
-                    "final_url": entry["final_url"],
-                },
-            )
-        )
+        env_base = os.getenv("BASE_URL")
+        if env_base:
+            base = env_base.rstrip("/")
+        else:
+            base = request.url_root.rstrip("/")
+        
+        row_data = {
+            "redirect_url": _build_redirect_url(entry["redirect_slug"]),
+            "final_url": entry["final_url"],
+            "has_local_qr": bool(entry.get("qr_local_base64")),
+            "local_pdf_url": f"{base}/pdf/{unique_id}" if entry.get("local_file_path") else None,
+        }
+        rows.append((unique_id, row_data))
     rows.sort(key=lambda row: row[0])
     confirm_id = request.args.get("confirm", "")
     return render_template_string(
