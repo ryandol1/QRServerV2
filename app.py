@@ -99,12 +99,26 @@ def _download_pdf(url: str, unique_id: str) -> Optional[str]:
         safe_id = _sanitize_unique_id(unique_id)
         file_path = PDF_STORAGE_DIR / f"{safe_id}.pdf"
         
+        # Ensure the directory exists
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        
         # Save the file
         with open(file_path, "wb") as f:
             for chunk in response.iter_content(chunk_size=8192):
                 f.write(chunk)
         
-        return str(file_path)
+        # Verify the file is actually a PDF by checking the header
+        try:
+            with open(file_path, "rb") as f:
+                header = f.read(4)
+                if header != b"%PDF":
+                    print(f"Warning: Downloaded file for {unique_id} does not appear to be a valid PDF (header: {header})")
+                    # Still return the path, but log the warning
+        except Exception as e:
+            print(f"Error verifying PDF for {unique_id}: {e}")
+        
+        # Return absolute path to avoid path resolution issues
+        return str(file_path.resolve())
     except Exception as e:
         # Log error but don't fail the entire request
         print(f"Error downloading PDF from {url}: {e}")
@@ -554,16 +568,43 @@ def serve_pdf(unique_id: str):
     if not local_file_path:
         return jsonify({"error": "local PDF not available"}), 404
     
+    # Try to resolve the file path - handle both absolute and relative paths
     file_path = Path(local_file_path)
-    if not file_path.exists():
-        return jsonify({"error": "PDF file not found on server"}), 404
+    if not file_path.is_absolute():
+        # If relative, resolve it relative to the PDF_STORAGE_DIR
+        file_path = PDF_STORAGE_DIR / file_path.name
     
-    return send_file(
-        str(file_path),
-        mimetype="application/pdf",
-        as_attachment=False,
-        download_name=f"{unique_id}.pdf",
-    )
+    # If file doesn't exist, try to reconstruct the path from unique_id
+    if not file_path.exists():
+        safe_id = _sanitize_unique_id(unique_id)
+        file_path = PDF_STORAGE_DIR / f"{safe_id}.pdf"
+    
+    if not file_path.exists():
+        return jsonify({
+            "error": "PDF file not found on server",
+            "details": f"Expected path: {file_path}",
+            "unique_id": unique_id
+        }), 404
+    
+    try:
+        response = send_file(
+            str(file_path),
+            mimetype="application/pdf",
+            as_attachment=False,
+            download_name=f"{unique_id}.pdf",
+        )
+        # Ensure the PDF is displayed inline in the browser
+        response.headers["Content-Disposition"] = f'inline; filename="{unique_id}.pdf"'
+        response.headers["Content-Type"] = "application/pdf"
+        # Add cache control headers
+        response.headers["Cache-Control"] = "public, max-age=3600"
+        return response
+    except Exception as e:
+        print(f"Error serving PDF for {unique_id}: {e}")
+        return jsonify({
+            "error": "Error serving PDF file",
+            "details": str(e)
+        }), 500
 
 
 @app.route("/admin/export/<fmt>", methods=["GET"])
