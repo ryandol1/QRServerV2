@@ -79,15 +79,57 @@ def _encode_qr_code(data: str) -> str:
     return base64.b64encode(buffer.read()).decode("ascii")
 
 
+def _convert_sharepoint_url(url: str) -> str:
+    """
+    Attempt to convert a SharePoint sharing link to a direct download URL.
+    SharePoint sharing links often return HTML login pages, so we try to convert
+    them to direct download URLs.
+    """
+    # If it's already a direct download URL, return as-is
+    if "/_layouts/15/download.aspx" in url or "/download.aspx" in url:
+        return url
+    
+    # Try to convert sharing links to direct download format
+    # Format: https://[tenant].sharepoint.com/:b:/g/[encoded_path]
+    # or: https://[tenant].sharepoint.com/sites/[site]/Shared%20Documents/[file]
+    if "sharepoint.com" in url.lower():
+        # Extract the base URL and file path
+        try:
+            from urllib.parse import urlparse, parse_qs, unquote
+            parsed = urlparse(url)
+            
+            # If it's a sharing link with :b: or :w: format, we can't easily convert it
+            # The user needs to provide a direct link from Power Automate
+            if "/:b:" in url or "/:w:" in url or "/:t:" in url:
+                print(f"Warning: SharePoint sharing link detected. Power Automate should provide a direct download URL instead.")
+                # Return original URL - we'll try it but it may fail
+                return url
+            
+            # If it's already a direct file path, try to convert to download.aspx format
+            if "/sites/" in url or "/teams/" in url:
+                # This might be a direct file URL, try adding download.aspx
+                # But this is complex, so for now just return original
+                return url
+        except Exception as e:
+            print(f"Error parsing SharePoint URL: {e}")
+    
+    return url
+
+
 def _download_pdf(url: str, unique_id: str) -> Optional[str]:
     """
     Download a PDF from the given URL and save it locally.
     Returns the local file path if successful, None otherwise.
     """
     try:
+        # Try to convert SharePoint sharing links to direct download URLs
+        download_url = _convert_sharepoint_url(url)
+        if download_url != url:
+            print(f"Converted SharePoint URL for {unique_id}: {url} -> {download_url}")
+        
         # Download the file
-        print(f"Downloading PDF for {unique_id} from: {url}")
-        response = requests.get(url, timeout=30, stream=True, allow_redirects=True)
+        print(f"Downloading PDF for {unique_id} from: {download_url}")
+        response = requests.get(download_url, timeout=30, stream=True, allow_redirects=True)
         response.raise_for_status()
         
         # Log response details for debugging
@@ -122,18 +164,39 @@ def _download_pdf(url: str, unique_id: str) -> Optional[str]:
                 header = f.read(1024)  # Read more to check for HTML
                 file_size = file_path.stat().st_size
                 
-                if header.startswith(b"%PDF"):
-                    pdf_version = header[4:8].decode('ascii', errors='ignore')
+                # Strip leading whitespace/newlines (SharePoint sometimes adds these)
+                header_stripped = header.lstrip(b'\r\n\t ')
+                
+                if header_stripped.startswith(b"%PDF"):
+                    pdf_version = header_stripped[4:8].decode('ascii', errors='ignore')
                     print(f"Valid PDF detected for {unique_id}: PDF version {pdf_version}, size={file_size} bytes")
-                elif header.startswith(b"<!DOCTYPE") or header.startswith(b"<html") or b"<HTML" in header[:100]:
-                    print(f"ERROR: Downloaded file for {unique_id} appears to be HTML, not PDF!")
-                    print(f"First 500 chars: {header[:500].decode('utf-8', errors='ignore')}")
-                    # Store this info for debugging
-                    redirect_map.get(unique_id, {}).get("_debug_info", {})["download_error"] = "File appears to be HTML, not PDF"
+                elif (header_stripped.startswith(b"<!DOCTYPE") or 
+                      header_stripped.startswith(b"<html") or 
+                      header_stripped.startswith(b"<HTML") or
+                      b"<HTML" in header[:200] or
+                      b"<!DOCTYPE" in header[:200] or
+                      b"<html" in header[:200] or
+                      b"SharePoint" in header[:500] or
+                      b"sign in" in header[:500].lower() or
+                      b"authentication" in header[:500].lower()):
+                    print(f"ERROR: Downloaded file for {unique_id} appears to be HTML (likely SharePoint login page), not PDF!")
+                    preview = header[:500].decode('utf-8', errors='ignore')
+                    print(f"First 500 chars: {preview}")
+                    
+                    # Delete the invalid file
+                    try:
+                        file_path.unlink()
+                        print(f"Deleted invalid HTML file for {unique_id}")
+                    except Exception as e:
+                        print(f"Error deleting invalid file: {e}")
+                    
+                    # Return None to indicate failure
+                    return None
                 else:
                     print(f"Warning: Downloaded file for {unique_id} does not appear to be a valid PDF")
                     print(f"Header (first 100 bytes): {header[:100]}")
                     print(f"File size: {file_size} bytes")
+                    # Still return the path, but log the warning
         except Exception as e:
             print(f"Error verifying PDF for {unique_id}: {e}")
         
@@ -395,6 +458,14 @@ def handle_webhook():
             base = request.url_root.rstrip("/")
         response_data["qr_local_base64"] = entry["qr_local_base64"]
         response_data["local_pdf_url"] = f"{base}/pdf/{unique_id}"
+    else:
+        # If PDF download failed, add a warning message
+        if "sharepoint.com" in entry["final_url"].lower():
+            response_data["pdf_download_warning"] = (
+                "PDF download failed. SharePoint sharing links often return HTML login pages. "
+                "Please ensure Power Automate provides a direct download URL (not a sharing link). "
+                "Check server logs for details."
+            )
 
     return (
         jsonify(response_data),
